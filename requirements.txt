@@ -1,2 +1,2 @@
-httpx[http2
+httpx[http2]
 colorama
