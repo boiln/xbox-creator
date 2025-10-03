@@ -638,21 +638,6 @@ class XboxAccountCreator:
 
             user_token = response.json()["Token"]
 
-            xsts_body = {
-                "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
-                "RelyingParty": "http://mp.microsoft.com/",
-                "TokenType": "JWT",
-            }
-
-            response = await client.post(XSTS_AUTH_URL, json=xsts_body, headers=headers)
-            if response.status_code != 200:
-                self.logger.error(f"XSTS auth failed: {response.status_code}")
-                return None
-
-            xsts_data = response.json()
-            uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
-            xsts_token = xsts_data["Token"]
-
             self.logger.info("Connecting to Xbox Live")
 
             connect_params = {
@@ -680,15 +665,43 @@ class XboxAccountCreator:
                 if access_token_match:
                     xbox_access_token = access_token_match.group(1)
                     existing_profile = await self._check_existing_xbox_profile(
-                        xbox_access_token, uhs, xsts_token, credentials
+                        xbox_access_token, user_token, credentials
                     )
 
                     if existing_profile:
                         return existing_profile
 
-            return await self._create_new_xbox_profile(
-                response, client, headers, uhs, xsts_token, credentials
+            result = await self._create_new_xbox_profile(
+                response, client, headers, user_token, credentials
             )
+
+            if result:
+                xsts_body = {
+                    "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
+                    "RelyingParty": "http://mp.microsoft.com/",
+                    "TokenType": "JWT",
+                }
+
+                xsts_response = await client.post(XSTS_AUTH_URL, json=xsts_body, headers=headers)
+                if xsts_response.status_code != 200:
+                    self.logger.error(f"XSTS auth failed: {xsts_response.status_code}")
+                    if xsts_response.status_code == 401:
+                        self.logger.info(
+                            "Account needs Xbox profile creation - this should not happen after profile creation"
+                        )
+                    return None
+
+                xsts_data = xsts_response.json()
+                uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
+                xsts_token = xsts_data["Token"]
+
+                result["uhs"] = uhs
+                result["xsts_token"] = xsts_token
+
+                xbl_token = f"XBL3.0 x={uhs};{xsts_token}"
+                await self._save_account_data(result["gamertag"], xbl_token, credentials)
+
+            return result
 
         except Exception as e:
             self.logger.error(f"Xbox account creation failed: {e}")
@@ -696,7 +709,7 @@ class XboxAccountCreator:
             return None
 
     async def _check_existing_xbox_profile(
-        self, xbox_access_token: str, uhs: str, xsts_token: str, credentials: AccountCredentials
+        self, xbox_access_token: str, user_token: str, credentials: AccountCredentials
     ) -> Optional[Dict[str, Any]]:
         try:
             padded_token = xbox_access_token + "=" * (4 - len(xbox_access_token) % 4)
@@ -710,21 +723,41 @@ class XboxAccountCreator:
 
                 gamertag = xui.get("gtg", "")
                 xuid = xui.get("xid", "")
-                existing_uhs = xui.get("uhs", "")
 
                 if gamertag and xuid:
                     self.logger.info(f"Existing Xbox profile found: {gamertag} (XUID: {xuid})")
 
-                    xbl_token = f"XBL3.0 x={existing_uhs or uhs};{xsts_token}"
-
-                    await self._save_account_data(gamertag, xbl_token, credentials)
-
-                    return {
-                        "gamertag": gamertag,
-                        "xuid": xuid,
-                        "uhs": existing_uhs or uhs,
-                        "existing": True,
+                    xsts_body = {
+                        "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
+                        "RelyingParty": "http://mp.microsoft.com/",
+                        "TokenType": "JWT",
                     }
+
+                    headers = self.client_config["headers"].copy()
+                    async with self._create_client() as temp_client:
+                        xsts_response = await temp_client.post(
+                            XSTS_AUTH_URL, json=xsts_body, headers=headers
+                        )
+                        if xsts_response.status_code == 200:
+                            xsts_data = xsts_response.json()
+                            actual_uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
+                            xsts_token = xsts_data["Token"]
+
+                            xbl_token = f"XBL3.0 x={actual_uhs};{xsts_token}"
+                            await self._save_account_data(gamertag, xbl_token, credentials)
+
+                            return {
+                                "gamertag": gamertag,
+                                "xuid": xuid,
+                                "uhs": actual_uhs,
+                                "xsts_token": xsts_token,
+                                "existing": True,
+                            }
+                        else:
+                            self.logger.warning(
+                                f"XSTS auth failed for existing profile: {xsts_response.status_code}"
+                            )
+                            return None
 
             self.logger.info("No existing Xbox profile found - will create new one")
             return None
@@ -739,8 +772,7 @@ class XboxAccountCreator:
         logged_in_response: httpx.Response,
         client: httpx.AsyncClient,
         headers: Dict[str, str],
-        uhs: str,
-        xsts_token: str,
+        user_token: str,
         credentials: AccountCredentials,
     ) -> Optional[Dict[str, Any]]:
         try:
@@ -771,11 +803,12 @@ class XboxAccountCreator:
 
             proxy_url = f"{SISU_BASE_URL}/proxy?sessionid={session_id}"
 
-            gamertag = await self._reserve_gamertag(client, proxy_url, headers)
-            if not gamertag:
+            gamertag_result = await self._reserve_gamertag(client, proxy_url, headers)
+            if not gamertag_result:
                 return None
 
-            reservation_id = random.randint(1000000000, 9999999999)
+            gamertag, reservation_id = gamertag_result
+
             create_body = {
                 "CreateAccountWithGamertag": {
                     "Gamertag": gamertag,
@@ -797,19 +830,16 @@ class XboxAccountCreator:
                 created_gamertag = account_response.get("gamerTag", gamertag)
                 self.logger.info(f"Xbox account created with gamertag: {created_gamertag}")
 
-            except:
+            except Exception:
                 created_gamertag = gamertag
                 self.logger.info(f"Xbox account created (assuming gamertag: {gamertag})")
 
             await self._set_avatar(client, proxy_url, headers)
 
-            xbl_token = f"XBL3.0 x={uhs};{xsts_token}"
-            await self._save_account_data(created_gamertag, xbl_token, credentials)
-
             return {
                 "gamertag": created_gamertag,
                 "xuid": "new_account",
-                "uhs": uhs,
+                "user_token": user_token,
                 "existing": False,
             }
 
@@ -820,7 +850,7 @@ class XboxAccountCreator:
 
     async def _reserve_gamertag(
         self, client: httpx.AsyncClient, proxy_url: str, headers: Dict[str, str]
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, int]]:
         try:
             reservation_id: int = random.randint(1000000000, 9999999999)
             xbox_prefix: str = XboxConfig.GAMERTAG_PREFIX
@@ -851,7 +881,7 @@ class XboxAccountCreator:
 
                 if response.status_code == 200:
                     self.logger.info(f"Successfully reserved gamertag: {xbox_gamertag}")
-                    return xbox_gamertag
+                    return xbox_gamertag, reservation_id
                 else:
                     self.logger.debug(
                         f"Gamertag {xbox_gamertag} not available: {response.status_code}"
@@ -878,7 +908,7 @@ class XboxAccountCreator:
             self.logger.debug("Setting default avatar")
             response = await client.post(proxy_url, json=avatar_body, headers=headers)
 
-            if response.status_code == 200:
+            if response.status_code == 201:
                 self.logger.debug("Avatar set successfully")
             else:
                 self.logger.warning(f"Failed to set avatar: {response.status_code}")
@@ -893,8 +923,8 @@ class XboxAccountCreator:
         try:
             loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
 
-            gamertags_file: Path = Path(XboxConfig.GAMERTAGS_FILE)
-            tokens_file: Path = Path(XboxConfig.TOKENS_FILE)
+            gamertags_file: Path = Path(__file__).parent / XboxConfig.GAMERTAGS_FILE
+            tokens_file: Path = Path(__file__).parent / XboxConfig.TOKENS_FILE
 
             await loop.run_in_executor(
                 None,
@@ -1012,7 +1042,7 @@ class XboxAccountCreator:
         return processed_results
 
     def load_accounts_from_file(
-        self, filepath: Path = Path(XboxConfig.DEFAULT_ACCOUNTS_FILE)
+        self, filepath: Path = Path(__file__).parent / XboxConfig.DEFAULT_ACCOUNTS_FILE
     ) -> List[AccountCredentials]:
         if not filepath.exists():
             self.logger.warning(f"Accounts file not found: {filepath}")
@@ -1084,7 +1114,7 @@ async def amain():
     parser.add_argument(
         "--accounts",
         type=Path,
-        default=Path(XboxConfig.DEFAULT_ACCOUNTS_FILE),
+        default=Path(__file__).parent / XboxConfig.DEFAULT_ACCOUNTS_FILE,
         help="Path to accounts file",
     )
     parser.add_argument(
