@@ -52,6 +52,7 @@ SCOPE = "xboxlive.signin openid profile offline_access"
 XBOX_LIVE_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XSTS_AUTH_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 SISU_BASE_URL = "https://sisu.xboxlive.com"
+XSTS_RELYING_PARTY_PROFILE = "http://xboxlive.com"
 
 FLOW_TOKEN_PATTERNS = [
     re.compile(r'name="PPFT"[^>]*value="([^"]*)"'),
@@ -254,7 +255,20 @@ class XboxAccountCreator:
         }
 
         if self.proxy_url:
-            self.client_config["proxies"] = {"https": self.proxy_url, "http": self.proxy_url}
+
+            def _ensure_scheme(url: str) -> str:
+                if not url:
+                    return url
+                if url.startswith("http://") or url.startswith("https://"):
+                    return url
+
+                return f"http://{url}"
+
+            prox_val = _ensure_scheme(self.proxy_url)
+            self.client_config["proxies"] = prox_val
+            self.logger.debug(
+                f"Configured single proxy for httpx: {prox_val} (original={self.proxy_url})"
+            )
 
         self._session_cache: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 
@@ -678,7 +692,7 @@ class XboxAccountCreator:
             if result:
                 xsts_body = {
                     "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
-                    "RelyingParty": "http://mp.microsoft.com/",
+                    "RelyingParty": XSTS_RELYING_PARTY_PROFILE,
                     "TokenType": "JWT",
                 }
 
@@ -699,6 +713,9 @@ class XboxAccountCreator:
                 result["xsts_token"] = xsts_token
 
                 xbl_token = f"XBL3.0 x={uhs};{xsts_token}"
+                self.logger.debug(
+                    f"Generated XSTS token for profile API (relyingParty={XSTS_RELYING_PARTY_PROFILE}, uhs={uhs}, token_len={len(xsts_token)})"
+                )
                 await self._save_account_data(result["gamertag"], xbl_token, credentials)
 
             return result
@@ -729,7 +746,7 @@ class XboxAccountCreator:
 
                     xsts_body = {
                         "Properties": {"SandboxId": "RETAIL", "UserTokens": [user_token]},
-                        "RelyingParty": "http://mp.microsoft.com/",
+                        "RelyingParty": XSTS_RELYING_PARTY_PROFILE,
                         "TokenType": "JWT",
                     }
 
@@ -744,6 +761,9 @@ class XboxAccountCreator:
                             xsts_token = xsts_data["Token"]
 
                             xbl_token = f"XBL3.0 x={actual_uhs};{xsts_token}"
+                            self.logger.debug(
+                                f"Existing profile XSTS token (relyingParty={XSTS_RELYING_PARTY_PROFILE}, uhs={actual_uhs}, token_len={len(xsts_token)})"
+                            )
                             await self._save_account_data(gamertag, xbl_token, credentials)
 
                             return {
