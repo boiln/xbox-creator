@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import httpx
+import rnet
 
 try:
     from colorama import Back, Fore, Style, init
@@ -39,11 +39,7 @@ except ImportError:
     COLORS_AVAILABLE = False
 
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
-)
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
 
 CLIENT_ID = "1f907974-e22b-4810-a9de-d9647380c97e"
 REDIRECT_URI = "https://www.xbox.com/auth/msa?action=loggedIn&locale_hint=en-US"
@@ -138,7 +134,6 @@ class XboxLogFormatter(logging.Formatter):
     def _truncate_message(self, message: str) -> str:
         if len(message) <= self.max_length:
             return message
-
         return message[: self.max_length - 2] + XboxConfig.LOG_TRUNCATION_SUFFIX
 
     def _get_status_prefix(self, record: logging.LogRecord) -> str:
@@ -156,10 +151,56 @@ class XboxLogFormatter(logging.Formatter):
             return self.colors["INFO"]
 
     def format(self, record: logging.LogRecord) -> str:
-        message = self._truncate_message(record.getMessage())
+        if record.levelname in ("DEBUG", "ERROR", "WARNING", "CRITICAL") or record.exc_info:
+            message = record.getMessage()
+        else:
+            message = self._truncate_message(record.getMessage())
+
         status = self._get_status_prefix(record)
 
         return f"{status} {message}"
+
+
+class Session:
+    """Session wrapper that auto-manages cookies"""
+
+    def __init__(self, client: rnet.Client):
+        self.client = client
+        self.cookies: Dict[str, str] = {}
+
+    def _update_cookies(self, response: rnet.Response) -> None:
+        """Extract and store cookies from response"""
+        for cookie in response.cookies:
+            self.cookies[cookie.name] = cookie.value
+
+    def _apply_cookies(self, headers: Dict[str, str]) -> None:
+        """Apply stored cookies to request headers"""
+        if self.cookies:
+            headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
+
+    def get_cookie(self, name: str) -> Optional[str]:
+        """Get cookie value by name"""
+        return self.cookies.get(name)
+
+    async def get(
+        self, url: str, headers: Optional[Dict[str, str]] = None, **kwargs
+    ) -> rnet.Response:
+        """GET request with automatic cookie management"""
+        headers = headers or {}
+        self._apply_cookies(headers)
+        response = await self.client.get(url, headers=headers, **kwargs)
+        self._update_cookies(response)
+        return response
+
+    async def post(
+        self, url: str, headers: Optional[Dict[str, str]] = None, **kwargs
+    ) -> rnet.Response:
+        """POST request with automatic cookie management"""
+        headers = headers or {}
+        self._apply_cookies(headers)
+        response = await self.client.post(url, headers=headers, **kwargs)
+        self._update_cookies(response)
+        return response
 
 
 @dataclass
@@ -228,21 +269,40 @@ class XboxAccountCreator:
 
         self.logger: logging.Logger
         self._setup_logging()
+
+        proxies = None
+        if self.proxy_url:
+
+            def _ensure_scheme(url: str) -> str:
+                if not url:
+                    return url
+                if url.startswith("http://") or url.startswith("https://"):
+                    return url
+                return f"http://{url}"
+
+            prox_val = _ensure_scheme(self.proxy_url)
+            proxies = [rnet.Proxy.all(prox_val)]
+            self.logger.debug(
+                f"Configured single proxy for rnet: {prox_val} (original={self.proxy_url})"
+            )
+
         self.client_config: Dict[str, Any] = {
-            "http2": True,
+            "timeout": int(self.request_timeout),
+            "read_timeout": int(self.request_timeout),
+            "allow_redirects": True,
+            "history": True,
+            "pool_max_size": self.connection_pool_size,
+            "pool_max_idle_per_host": self.max_keepalive_connections,
+            "pool_idle_timeout": int(XboxConfig.KEEPALIVE_EXPIRY),
             "verify": False,
-            "timeout": httpx.Timeout(self.request_timeout),
-            "follow_redirects": True,
-            "limits": httpx.Limits(
-                max_connections=self.connection_pool_size,
-                max_keepalive_connections=self.max_keepalive_connections,
-                keepalive_expiry=XboxConfig.KEEPALIVE_EXPIRY,
-            ),
+            "danger_accept_invalid_certs": True,
+            "gzip": True,
+            "brotli": True,
+            "deflate": True,
+            "user_agent": DEFAULT_USER_AGENT,
             "headers": {
-                "User-Agent": DEFAULT_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
@@ -254,21 +314,8 @@ class XboxAccountCreator:
             },
         }
 
-        if self.proxy_url:
-
-            def _ensure_scheme(url: str) -> str:
-                if not url:
-                    return url
-                if url.startswith("http://") or url.startswith("https://"):
-                    return url
-
-                return f"http://{url}"
-
-            prox_val = _ensure_scheme(self.proxy_url)
-            self.client_config["proxies"] = prox_val
-            self.logger.debug(
-                f"Configured single proxy for httpx: {prox_val} (original={self.proxy_url})"
-            )
+        if proxies:
+            self.client_config["proxies"] = proxies
 
         self._session_cache: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 
@@ -287,11 +334,28 @@ class XboxAccountCreator:
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
 
-    def _create_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(**self.client_config)
+    def _create_client(self) -> rnet.Client:
+        config = self.client_config.copy()
+        config["cookie_store"] = True
+        return rnet.Client(**config)
 
     def _generate_random_string(self, length: int) -> str:
         return "".join(random.choices(RANDOM_CHOICES, k=length))
+
+    @staticmethod
+    def _dict_to_form(data: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """Convert a dictionary to a list of tuples for rnet form/query parameters."""
+        return [(k, str(v)) for k, v in data.items()]
+
+    @staticmethod
+    def _get_header(response: rnet.Response, header_name: str) -> Optional[str]:
+        """Get header value from response, handling bytes/string conversion."""
+        header_name_lower = header_name.lower()
+        for name, value in response.headers.items():
+            name_str = name.decode() if isinstance(name, bytes) else name
+            if name_str.lower() == header_name_lower:
+                return value.decode() if isinstance(value, bytes) else value
+        return None
 
     def _format_duration(self, seconds: float) -> str:
         if seconds < 1:
@@ -324,12 +388,12 @@ class XboxAccountCreator:
 
         return form_data
 
-    async def _handle_rate_limit(self, response: httpx.Response) -> Optional[RateLimitInfo]:
-        if response.status_code != 429:
+    async def _handle_rate_limit(self, response: rnet.Response) -> Optional[RateLimitInfo]:
+        if response.status_code.as_int() != 429:
             return None
 
         try:
-            data = response.json()
+            data = await response.json()
             rate_limit = RateLimitInfo(
                 current_requests=data.get("currentRequests", 0),
                 max_requests=data.get("maxRequests", 100),
@@ -352,16 +416,17 @@ class XboxAccountCreator:
             return None
 
     async def authenticate_microsoft_account(
-        self, client: httpx.AsyncClient, credentials: AccountCredentials
-    ) -> Optional[Tuple[str, str]]:
+        self, client: rnet.Client, credentials: AccountCredentials
+    ) -> Optional[Tuple[str, str, Session]]:
         """
         Perform Microsoft OAuth2 authentication flow asynchronously.
 
         Returns:
-            Tuple of (authorization_code, code_verifier) if successful, None otherwise
+            Tuple of (authorization_code, code_verifier, session) if successful, None otherwise
         """
         try:
             self.logger.info(f"Starting auth flow: {credentials.email}")
+            self.logger.debug("Creating client_request_id")
 
             client_request_id: str = self._generate_random_string(
                 XboxConfig.CLIENT_REQUEST_ID_LENGTH
@@ -402,28 +467,43 @@ class XboxAccountCreator:
             }
 
             headers = self.client_config["headers"].copy()
+            session = Session(client)
 
-            response = await client.get(
+            self.logger.debug("About to make OAuth init request")
+            response = await session.get(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
-                params=params,
+                query=self._dict_to_form(params),
                 headers=headers,
             )
 
-            if response.status_code != 200:
-                self.logger.error(f"OAuth2 init failed: {response.status_code}")
+            self.logger.debug("OAuth init request completed, extracting status")
+            response_status = response.status_code.as_int()
+            self.logger.debug(f"Extracted status: {response_status}")
+            response_url = str(response.url)
+            self.logger.debug(f"Extracted URL: {response_url}")
+            response_cookies = list(response.cookies) if self.debug_mode else []
+
+            if self.debug_mode:
+                self.logger.debug(f"OAuth init status: {response_status}")
+                self.logger.debug(f"OAuth init URL: {response_url}")
+                self.logger.debug(f"OAuth init cookies: {[c.name for c in response_cookies]}")
+
+            if response_status != 200:
+                self.logger.error(f"OAuth2 init failed: {response_status}")
                 return None
 
-            flow_token = self._extract_flow_token(response.text)
+            response_text = await response.text()
+            flow_token = self._extract_flow_token(response_text)
             if not flow_token:
                 self.logger.error("Could not extract flow token")
                 return None
 
-            uaid = response.cookies.get("uaid")
+            uaid = session.get_cookie("uaid")
             if not uaid:
                 self.logger.error("Could not extract UAID from cookies")
                 return None
 
-            opid_match = OPID_PATTERN.search(response.text)
+            opid_match = OPID_PATTERN.search(response_text)
             if not opid_match:
                 self.logger.error("Could not extract OPID")
                 return None
@@ -447,15 +527,27 @@ class XboxAccountCreator:
                 "flowToken": flow_token,
             }
 
-            response = await client.post(
-                "https://login.live.com/GetCredentialType.srf", json=email_body, headers=headers
+            response = await session.post(
+                "https://login.live.com/GetCredentialType.srf",
+                json=email_body,
+                headers=headers,
             )
 
-            if response.status_code != 200:
-                self.logger.error(f"Email submission failed: {response.status_code}")
+            response_status = response.status_code.as_int()
+            response_url = str(response.url)
+            response_cookies_count = len(list(response.cookies)) if self.debug_mode else 0
+
+            if self.debug_mode:
+                self.logger.debug(f"GetCredentialType status: {response_status}")
+                self.logger.debug(f"GetCredentialType URL: {response_url}")
+                self.logger.debug(f"Cookies after GetCredentialType: {response_cookies_count}")
+
+            if response_status != 200:
+                self.logger.error(f"Email submission failed: {response_status}")
                 return None
 
-            if response.json().get("IfExistsResult") == 1:
+            response_json = await response.json()
+            if response_json.get("IfExistsResult") == 1:
                 self.logger.error("Microsoft account does not exist")
                 return None
 
@@ -490,33 +582,46 @@ class XboxAccountCreator:
                 "i19": "060601",
             }
 
-            response = await client.post(
+            response = await session.post(
                 f"https://login.live.com/ppsecure/post.srf?opid={opid}&uaid={uaid}",
-                data=password_body,
+                form=self._dict_to_form(password_body),
                 headers=headers,
             )
 
-            if response.status_code != 200:
-                self.logger.error(f"Password submission failed: {response.status_code}")
+            response_status = response.status_code.as_int()
+            response_url = str(response.url)
+            response_headers = list(response.headers.items()) if self.debug_mode else []
+
+            if self.debug_mode:
+                self.logger.debug(f"Password submission status: {response_status}")
+                self.logger.debug(f"Password submission URL: {response_url}")
+                for name, value in response_headers:
+                    name_str = name.decode() if isinstance(name, bytes) else name
+                    value_str = value.decode() if isinstance(value, bytes) else value
+                    if name_str.lower() in ["location", "set-cookie"]:
+                        self.logger.debug(f"Header {name_str}: {value_str[:100]}")
+
+            if response_status != 200:
+                self.logger.error(f"Password submission failed: {response_status}")
                 return None
 
-            if "Account or password is incorrect" in response.text:
+            response_text = await response.text()
+            if "Account or password is incorrect" in response_text:
                 self.logger.error("Invalid credentials")
                 return None
 
-            response = await self._handle_post_auth_forms(
-                response, client, headers, opid, uaid, flow_token, credentials
+            response, location, response_url = await self._handle_post_auth_forms(
+                response_text, response, session, headers, opid, uaid, flow_token, credentials
             )
 
-            location = response.headers.get("Location", "")
-            url_code_match = CODE_PATTERN.search(str(response.url))
+            url_code_match = CODE_PATTERN.search(response_url)
             location_code_match = CODE_PATTERN.search(location)
 
             code_match = location_code_match or url_code_match
 
             if code_match:
                 self.logger.info("Successfully obtained auth code")
-                return code_match.group(1), code_verifier.decode()
+                return code_match.group(1), code_verifier.decode(), session
             else:
                 self.logger.error(
                     f"Could not extract authorization code. Location: {location}, URL: {response.url}"
@@ -524,50 +629,106 @@ class XboxAccountCreator:
                 return None
 
         except Exception as e:
+            import traceback
+
             self.logger.error(f"Authentication failed: {e}")
+            traceback.print_exc()
 
             return None
 
     async def _handle_post_auth_forms(
         self,
-        response: httpx.Response,
-        client: httpx.AsyncClient,
+        response_text: str,
+        response: rnet.Response,
+        session: Session,
         headers: Dict[str, str],
         opid: str,
         uaid: str,
         flow_token: str,
         credentials: AccountCredentials,
-    ) -> httpx.Response:
+    ) -> Tuple[rnet.Response, str, str]:
         current_response = response
+        current_response_text = response_text
 
-        privacy_form = self._extract_form_data(current_response.text)
+        privacy_form = self._extract_form_data(current_response_text)
         if privacy_form and "privacynotice" in privacy_form.get("action", "").lower():
             self.logger.debug("Submitting privacy notice acceptance")
-            current_response = await client.post(
-                privacy_form["action"], data=privacy_form, headers=headers, follow_redirects=True
+            current_response = await session.post(
+                privacy_form["action"],
+                form=self._dict_to_form(privacy_form),
+                headers=headers,
+            )
+            current_response_text = await current_response.text()
+
+        if "Stay signed in?" in current_response_text or "kmsi" in current_response_text.lower():
+            self.logger.debug("Handling 'Stay signed in' prompt")
+            keep_login_url = (
+                f"https://login.live.com/ppsecure/post.srf?nopa=2&uaid={uaid}&opid={opid}"
+            )
+            keep_login_body = {
+                "LoginOptions": "3",
+                "type": "28",
+                "ctx": "",
+                "hpgrequestid": "",
+                "PPFT": flow_token,
+                "canary": "",
+            }
+
+            self.logger.debug("Cancelling keep login state")
+            current_response = await session.post(
+                keep_login_url,
+                form=self._dict_to_form(keep_login_body),
+                headers=headers,
+                allow_redirects=False,
             )
 
-        keep_login_url = f"https://login.live.com/ppsecure/post.srf?nopa=2&uaid={uaid}&opid={opid}"
-        keep_login_body = {
-            "LoginOptions": "3",
-            "type": "28",
-            "ctx": "",
-            "hpgrequestid": "",
-            "PPFT": flow_token,
-            "canary": "",
-        }
+            if self.debug_mode:
+                resp_status = current_response.status_code.as_int()
+                resp_headers = list(current_response.headers.items())
+                self.logger.debug(f"Response status: {resp_status}")
+                self.logger.debug("All headers:")
+                for name, value in resp_headers:
+                    name_str = name.decode() if isinstance(name, bytes) else name
+                    value_str = value.decode() if isinstance(value, bytes) else value
+                    self.logger.debug(
+                        f"  {name_str}: {value_str[:200] if len(value_str) > 200 else value_str}"
+                    )
 
-        self.logger.debug("Cancelling keep login state")
-        current_response = await client.post(keep_login_url, data=keep_login_body, headers=headers)
+        for _ in range(10):
+            status = current_response.status_code.as_int()
+            location = self._get_header(current_response, "location")
+            current_url = str(current_response.url)
 
-        return current_response
+            if status not in (301, 302, 303, 307, 308):
+                break
+
+            if not location:
+                break
+
+            if "#code=" in location or "?code=" in location or "&code=" in location:
+                self.logger.debug(f"Found code in redirect Location header: {location}")
+                return current_response, location, current_url
+
+            self.logger.debug(f"Following final redirect ({status}) to: {location}")
+            current_response = await session.get(location, headers=headers)
+
+            new_url = str(current_response.url)
+            if "#" in new_url or "code=" in new_url:
+                self.logger.debug(f"Found code in redirected URL: {new_url}")
+                new_location = self._get_header(current_response, "location") or ""
+                return current_response, new_location, new_url
+
+        final_location = self._get_header(current_response, "location") or ""
+        final_url = str(current_response.url)
+        return current_response, final_location, final_url
 
     async def create_xbox_account(
         self,
-        client: httpx.AsyncClient,
+        client: rnet.Client,
         authorization_code: str,
         code_verifier: str,
         credentials: AccountCredentials,
+        auth_session: Session,
     ) -> Optional[Dict[str, Any]]:
         """
         Create Xbox Live account.
@@ -598,17 +759,19 @@ class XboxAccountCreator:
             headers = self.client_config["headers"].copy()
             headers["origin"] = "https://www.xbox.com"
 
-            response = await client.post(
+            session = auth_session
+
+            response = await session.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-                data=token_body,
+                form=self._dict_to_form(token_body),
                 headers=headers,
             )
 
-            if response.status_code != 200:
-                self.logger.error(f"Token exchange failed: {response.status_code}")
+            if response.status_code.as_int() != 200:
+                self.logger.error(f"Token exchange failed: {response.status_code.as_int()}")
                 return None
 
-            token_data = response.json()
+            token_data = await response.json()
             access_token = token_data.get("access_token")
             id_token = token_data.get("id_token")
 
@@ -645,12 +808,13 @@ class XboxAccountCreator:
                 "TokenType": "JWT",
             }
 
-            response = await client.post(XBOX_LIVE_AUTH_URL, json=xbox_auth_body, headers=headers)
-            if response.status_code != 200:
-                self.logger.error(f"Xbox Live auth failed: {response.status_code}")
+            response = await session.post(XBOX_LIVE_AUTH_URL, json=xbox_auth_body, headers=headers)
+            if response.status_code.as_int() != 200:
+                self.logger.error(f"Xbox Live auth failed: {response.status_code.as_int()}")
                 return None
 
-            user_token = response.json()["Token"]
+            user_token_data = await response.json()
+            user_token = user_token_data["Token"]
 
             self.logger.info("Connecting to Xbox Live")
 
@@ -663,12 +827,39 @@ class XboxAccountCreator:
                 "state": f'{{"ru":"https://www.xbox.com/en-US/xbox-game-pass/pc-game-pass","msaId":"{msa_id}","sid":"RETAIL"}}',
             }
 
-            response = await client.get(
+            response = await session.get(
                 f"{SISU_BASE_URL}/connect/XboxLive",
-                params=connect_params,
+                query=self._dict_to_form(connect_params),
                 headers=headers,
-                follow_redirects=True,
+                allow_redirects=False,
             )
+
+            self.logger.debug(f"Initial SISU response status: {response.status_code.as_int()}")
+            self.logger.debug(f"Initial SISU response URL: {response.url}")
+
+            redirect_history = []
+            for i in range(10):
+                status = response.status_code.as_int()
+                if status not in (301, 302, 303, 307, 308):
+                    self.logger.debug(f"Redirect {i}: Non-redirect status {status}, stopping")
+                    break
+
+                redirect_history.append(response)
+                location = self._get_header(response, "location")
+                if not location:
+                    self.logger.debug(f"Redirect {i}: No Location header, stopping")
+                    break
+
+                self.logger.debug(f"Redirect {i}: Following to {location[:100]} ..")
+                location = location.replace(" ", "%20")
+                response = await session.get(location, headers=headers, allow_redirects=False)
+
+            redirect_history.append(response)
+            self.logger.debug(f"Total redirect chain length: {len(redirect_history)}")
+            self.logger.debug(f"Final response status: {response.status_code.as_int()}")
+            self.logger.debug(f"Final response URL: {str(response.url)[:150]}")
+
+            history_list = redirect_history[:-1]
 
             if "xbox.com" in str(response.url) and "accessToken=" in str(response.url):
                 self.logger.info("Xbox Live connection successful")
@@ -686,7 +877,7 @@ class XboxAccountCreator:
                         return existing_profile
 
             result = await self._create_new_xbox_profile(
-                response, client, headers, user_token, credentials
+                response, history_list, session, headers, user_token, credentials
             )
 
             if result:
@@ -696,16 +887,16 @@ class XboxAccountCreator:
                     "TokenType": "JWT",
                 }
 
-                xsts_response = await client.post(XSTS_AUTH_URL, json=xsts_body, headers=headers)
-                if xsts_response.status_code != 200:
-                    self.logger.error(f"XSTS auth failed: {xsts_response.status_code}")
-                    if xsts_response.status_code == 401:
+                xsts_response = await session.post(XSTS_AUTH_URL, json=xsts_body, headers=headers)
+                if xsts_response.status_code.as_int() != 200:
+                    self.logger.error(f"XSTS auth failed: {xsts_response.status_code.as_int()}")
+                    if xsts_response.status_code.as_int() == 401:
                         self.logger.info(
                             "Account needs Xbox profile creation - this should not happen after profile creation"
                         )
                     return None
 
-                xsts_data = xsts_response.json()
+                xsts_data = await xsts_response.json()
                 uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
                 xsts_token = xsts_data["Token"]
 
@@ -751,33 +942,33 @@ class XboxAccountCreator:
                     }
 
                     headers = self.client_config["headers"].copy()
-                    async with self._create_client() as temp_client:
-                        xsts_response = await temp_client.post(
-                            XSTS_AUTH_URL, json=xsts_body, headers=headers
+                    temp_client = self._create_client()
+                    xsts_response = await temp_client.post(
+                        XSTS_AUTH_URL, json=xsts_body, headers=headers
+                    )
+                    if xsts_response.status_code.as_int() == 200:
+                        xsts_data = await xsts_response.json()
+                        actual_uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
+                        xsts_token = xsts_data["Token"]
+
+                        xbl_token = f"XBL3.0 x={actual_uhs};{xsts_token}"
+                        self.logger.debug(
+                            f"Existing profile XSTS token (relyingParty={XSTS_RELYING_PARTY_PROFILE}, uhs={actual_uhs}, token_len={len(xsts_token)})"
                         )
-                        if xsts_response.status_code == 200:
-                            xsts_data = xsts_response.json()
-                            actual_uhs = xsts_data["DisplayClaims"]["xui"][0]["uhs"]
-                            xsts_token = xsts_data["Token"]
+                        await self._save_account_data(gamertag, xbl_token, credentials)
 
-                            xbl_token = f"XBL3.0 x={actual_uhs};{xsts_token}"
-                            self.logger.debug(
-                                f"Existing profile XSTS token (relyingParty={XSTS_RELYING_PARTY_PROFILE}, uhs={actual_uhs}, token_len={len(xsts_token)})"
-                            )
-                            await self._save_account_data(gamertag, xbl_token, credentials)
-
-                            return {
-                                "gamertag": gamertag,
-                                "xuid": xuid,
-                                "uhs": actual_uhs,
-                                "xsts_token": xsts_token,
-                                "existing": True,
-                            }
-                        else:
-                            self.logger.warning(
-                                f"XSTS auth failed for existing profile: {xsts_response.status_code}"
-                            )
-                            return None
+                        return {
+                            "gamertag": gamertag,
+                            "xuid": xuid,
+                            "uhs": actual_uhs,
+                            "xsts_token": xsts_token,
+                            "existing": True,
+                        }
+                    else:
+                        self.logger.warning(
+                            f"XSTS auth failed for existing profile: {xsts_response.status_code.as_int()}"
+                        )
+                        return None
 
             self.logger.info("No existing Xbox profile found - will create new one")
             return None
@@ -789,8 +980,9 @@ class XboxAccountCreator:
 
     async def _create_new_xbox_profile(
         self,
-        logged_in_response: httpx.Response,
-        client: httpx.AsyncClient,
+        logged_in_response: rnet.Response,
+        redirect_history: list,
+        session: Session,
         headers: Dict[str, str],
         user_token: str,
         credentials: AccountCredentials,
@@ -798,14 +990,23 @@ class XboxAccountCreator:
         try:
             self.logger.info("Creating new Xbox profile")
 
-            logged_in_redirects = logged_in_response.history
+            logged_in_redirects = redirect_history
             if len(logged_in_redirects) <= 2:
                 self.logger.error(f"Expected more than 2 redirects, got {len(logged_in_redirects)}")
                 return None
 
-            session_id_match = re.search(
-                r"sid=(.+?)&", logged_in_redirects[2].headers.get("Location", "")
-            )
+            redirect_location = None
+            for name, value in logged_in_redirects[2].headers.items():
+                name_str = name.decode() if isinstance(name, bytes) else name
+                if name_str.lower() == "location":
+                    redirect_location = value.decode() if isinstance(value, bytes) else value
+                    break
+
+            if not redirect_location:
+                self.logger.error("Could not find Location header in redirect")
+                return None
+
+            session_id_match = re.search(r"sid=(.+?)&", redirect_location)
             if not session_id_match:
                 self.logger.error("Could not find session ID in redirect")
                 return None
@@ -813,7 +1014,7 @@ class XboxAccountCreator:
             session_id = session_id_match.group(1)
             self.logger.debug(f"Found session ID: {session_id}")
 
-            spt_match = re.search(r"spt=(.+?)&", logged_in_redirects[2].headers.get("Location", ""))
+            spt_match = re.search(r"spt=(.+?)&", redirect_location)
             if not spt_match:
                 self.logger.error("Could not find SPT token in redirect")
                 return None
@@ -823,7 +1024,7 @@ class XboxAccountCreator:
 
             proxy_url = f"{SISU_BASE_URL}/proxy?sessionid={session_id}"
 
-            gamertag_result = await self._reserve_gamertag(client, proxy_url, headers)
+            gamertag_result = await self._reserve_gamertag(session, proxy_url, headers)
             if not gamertag_result:
                 return None
 
@@ -837,30 +1038,39 @@ class XboxAccountCreator:
             }
 
             self.logger.info(f"Creating Xbox account with gamertag: {gamertag}")
-            response = await client.post(proxy_url, json=create_body, headers=headers)
+            response = await session.post(proxy_url, json=create_body, headers=headers)
 
-            if response.status_code != 200:
+            if response.status_code.as_int() != 200:
+                response_text = await response.text()
                 self.logger.error(
-                    f"Failed to create Xbox account: {response.status_code} - {response.text}"
+                    f"Failed to create Xbox account: {response.status_code.as_int()} - {response_text}"
                 )
                 return None
 
             try:
-                account_response = response.json()
+                account_response = await response.json()
                 created_gamertag = account_response.get("gamerTag", gamertag)
-                self.logger.info(f"Xbox account created with gamertag: {created_gamertag}")
+
+                is_existing = created_gamertag != gamertag
+
+                if is_existing:
+                    self.logger.info(f"Existing Xbox profile found: {created_gamertag}")
+                else:
+                    self.logger.info(f"Xbox account created with gamertag: {created_gamertag}")
 
             except Exception:
                 created_gamertag = gamertag
+                is_existing = False
                 self.logger.info(f"Xbox account created (assuming gamertag: {gamertag})")
 
-            await self._set_avatar(client, proxy_url, headers)
+            if not is_existing:
+                await self._set_avatar(session, proxy_url, headers)
 
             return {
                 "gamertag": created_gamertag,
                 "xuid": "new_account",
                 "user_token": user_token,
-                "existing": False,
+                "existing": is_existing,
             }
 
         except Exception as e:
@@ -869,7 +1079,7 @@ class XboxAccountCreator:
             return None
 
     async def _reserve_gamertag(
-        self, client: httpx.AsyncClient, proxy_url: str, headers: Dict[str, str]
+        self, session: Session, proxy_url: str, headers: Dict[str, str]
     ) -> Optional[Tuple[str, int]]:
         try:
             reservation_id: int = random.randint(1000000000, 9999999999)
@@ -893,18 +1103,18 @@ class XboxAccountCreator:
                 self.logger.debug(
                     f"Testing gamertag: {xbox_gamertag} (attempt {attempt + 1}/{max_attempts})"
                 )
-                response = await client.post(proxy_url, json=reserve_body, headers=headers)
+                response = await session.post(proxy_url, json=reserve_body, headers=headers)
 
-                if response.status_code == XboxConfig.RATE_LIMIT_STATUS_CODE:
+                if response.status_code.as_int() == XboxConfig.RATE_LIMIT_STATUS_CODE:
                     await self._handle_rate_limit(response)
                     continue
 
-                if response.status_code == 200:
+                if response.status_code.as_int() == 200:
                     self.logger.info(f"Successfully reserved gamertag: {xbox_gamertag}")
                     return xbox_gamertag, reservation_id
                 else:
                     self.logger.debug(
-                        f"Gamertag {xbox_gamertag} not available: {response.status_code}"
+                        f"Gamertag {xbox_gamertag} not available: {response.status_code.as_int()}"
                     )
 
                     await asyncio.sleep(XboxConfig.GAMERTAG_ATTEMPT_DELAY)
@@ -917,21 +1127,19 @@ class XboxAccountCreator:
 
             return None
 
-    async def _set_avatar(
-        self, client: httpx.AsyncClient, proxy_url: str, headers: Dict[str, str]
-    ) -> None:
+    async def _set_avatar(self, session: Session, proxy_url: str, headers: Dict[str, str]) -> None:
         try:
             avatar_body: Dict[str, Dict[str, str]] = {
                 "SetGamerpic": {"GamerPic": XboxConfig.DEFAULT_AVATAR_URL}
             }
 
             self.logger.debug("Setting default avatar")
-            response = await client.post(proxy_url, json=avatar_body, headers=headers)
+            response = await session.post(proxy_url, json=avatar_body, headers=headers)
 
-            if response.status_code == 201:
+            if response.status_code.as_int() == 201:
                 self.logger.debug("Avatar set successfully")
             else:
-                self.logger.warning(f"Failed to set avatar: {response.status_code}")
+                self.logger.warning(f"Failed to set avatar: {response.status_code.as_int()}")
 
         except Exception as e:
             self.logger.warning(f"Avatar setting failed (non-critical): {e}")
@@ -943,8 +1151,9 @@ class XboxAccountCreator:
         try:
             loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
 
-            gamertags_file: Path = Path(__file__).parent / XboxConfig.GAMERTAGS_FILE
-            tokens_file: Path = Path(__file__).parent / XboxConfig.TOKENS_FILE
+            gamertags_file: Path = Path(__file__).parent / "data" / XboxConfig.GAMERTAGS_FILE
+            tokens_file: Path = Path(__file__).parent / "data" / XboxConfig.TOKENS_FILE
+            tokens_file.parent.mkdir(exist_ok=True)
 
             await loop.run_in_executor(
                 None,
@@ -976,44 +1185,44 @@ class XboxAccountCreator:
         start_time = time.time()
 
         try:
-            async with self._create_client() as client:
-                auth_result = await self.authenticate_microsoft_account(client, credentials)
-                if not auth_result:
-                    return XboxAccountResult(
-                        credentials=credentials,
-                        success=False,
-                        error_message="Microsoft authentication failed",
-                        processing_time=time.time() - start_time,
-                    )
-
-                authorization_code, code_verifier = auth_result
-
-                xbox_result = await self.create_xbox_account(
-                    client, authorization_code, code_verifier, credentials
-                )
-
-                if not xbox_result:
-                    return XboxAccountResult(
-                        credentials=credentials,
-                        success=False,
-                        error_message="Xbox account creation failed",
-                        processing_time=time.time() - start_time,
-                    )
-
-                action = "Retrieved existing" if xbox_result.get("existing") else "Created"
-                processing_time = time.time() - start_time
-                time_str = self._format_duration(processing_time)
-                self.logger.info(
-                    f"{action} Xbox: {xbox_result['gamertag']} | {credentials.email} | {time_str}"
-                )
-
-                result = XboxAccountResult(
+            client = self._create_client()
+            auth_result = await self.authenticate_microsoft_account(client, credentials)
+            if not auth_result:
+                return XboxAccountResult(
                     credentials=credentials,
-                    success=True,
-                    gamertag=xbox_result["gamertag"],
-                    xuid=xbox_result.get("xuid"),
+                    success=False,
+                    error_message="Microsoft authentication failed",
                     processing_time=time.time() - start_time,
                 )
+
+            authorization_code, code_verifier, auth_session = auth_result
+
+            xbox_result = await self.create_xbox_account(
+                client, authorization_code, code_verifier, credentials, auth_session
+            )
+
+            if not xbox_result:
+                return XboxAccountResult(
+                    credentials=credentials,
+                    success=False,
+                    error_message="Xbox account creation failed",
+                    processing_time=time.time() - start_time,
+                )
+
+            action = "Retrieved existing" if xbox_result.get("existing") else "Created"
+            processing_time = time.time() - start_time
+            time_str = self._format_duration(processing_time)
+            self.logger.info(
+                f"{action} Xbox: {xbox_result['gamertag']} | {credentials.email} | {time_str}"
+            )
+
+            result = XboxAccountResult(
+                credentials=credentials,
+                success=True,
+                gamertag=xbox_result["gamertag"],
+                xuid=xbox_result.get("xuid"),
+                processing_time=time.time() - start_time,
+            )
 
         except Exception as e:
             self.logger.error(f"Unexpected error processing account {credentials.email}: {e}")
@@ -1062,7 +1271,7 @@ class XboxAccountCreator:
         return processed_results
 
     def load_accounts_from_file(
-        self, filepath: Path = Path(__file__).parent / XboxConfig.DEFAULT_ACCOUNTS_FILE
+        self, filepath: Path = Path(__file__).parent / "data" / XboxConfig.DEFAULT_ACCOUNTS_FILE
     ) -> List[AccountCredentials]:
         if not filepath.exists():
             self.logger.warning(f"Accounts file not found: {filepath}")
@@ -1134,7 +1343,7 @@ async def amain():
     parser.add_argument(
         "--accounts",
         type=Path,
-        default=Path(__file__).parent / XboxConfig.DEFAULT_ACCOUNTS_FILE,
+        default=Path(__file__).parent / "data" / XboxConfig.DEFAULT_ACCOUNTS_FILE,
         help="Path to accounts file",
     )
     parser.add_argument(
