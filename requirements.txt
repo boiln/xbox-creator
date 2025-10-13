@@ -1,2 +1,2 @@
-httpx[http2]
+rnet==2.4.2
 colorama
