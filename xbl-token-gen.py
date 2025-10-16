@@ -95,11 +95,15 @@ class XboxConfig:
 
     # Gamertag reservation
     MAX_GAMERTAG_ATTEMPTS: int = 20
-    GAMERTAG_ATTEMPT_DELAY: float = 0.1
+    GAMERTAG_ATTEMPT_DELAY: float = 0.25
     RESERVATION_DURATION: str = "1:00:00"
 
+    # Gamertag generation
+    GAMERTAG_GENERATE_COUNT: int = 10
+    GAMERTAG_GENERATE_ALGORITHM: str = "AdjectiveNoun"
+
     # Output formatting
-    MAX_LOG_MESSAGE_LENGTH: int = 100
+    MAX_LOG_MESSAGE_LENGTH: int = 125
     LOG_TRUNCATION_SUFFIX: str = " .."
 
     # File paths
@@ -248,6 +252,8 @@ class XboxAccountCreator:
         proxy_url: Optional[str] = None,
         connection_pool_size: int = XboxConfig.DEFAULT_CONNECTION_POOL_SIZE,
         max_keepalive_connections: int = XboxConfig.DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        use_random_gamertag: bool = True,
+        use_random_gamerpic: bool = True,
     ) -> None:
         self.max_workers: int = max_workers
         self.max_retries: int = max_retries
@@ -258,6 +264,11 @@ class XboxAccountCreator:
         self.proxy_url: Optional[str] = proxy_url or os.getenv("HTTPS_PROXY")
         self.connection_pool_size: int = connection_pool_size
         self.max_keepalive_connections: int = max_keepalive_connections
+
+        self.use_random_gamertag: bool = use_random_gamertag
+        self.use_random_gamerpic: bool = use_random_gamerpic
+        self._gamerpic_cache: Optional[List[Dict[str, str]]] = None
+        self._gamertag_pool: List[str] = []
 
         self._stats_lock: asyncio.Lock = asyncio.Lock()
         self.stats: Dict[str, Union[int, datetime]] = {
@@ -1083,14 +1094,27 @@ class XboxAccountCreator:
     ) -> Optional[Tuple[str, int]]:
         try:
             reservation_id: int = random.randint(1000000000, 9999999999)
-            xbox_prefix: str = XboxConfig.GAMERTAG_PREFIX
             max_attempts: int = XboxConfig.MAX_GAMERTAG_ATTEMPTS
 
             self.logger.debug("Starting gamertag reservation process")
 
+            if self.use_random_gamertag and not self._gamertag_pool:
+                generated = await self._generate_gamertags(session, proxy_url, headers)
+                if generated:
+                    self._gamertag_pool = generated
+                    self.logger.debug(f"Populated gamertag pool with {len(generated)} names")
+                else:
+                    self.logger.warning("Failed to generate gamertags, falling back to random")
+                    self.use_random_gamertag = False
+
             for attempt in range(max_attempts):
-                suffix_length: int = XboxConfig.GAMERTAG_SUFFIX_LENGTH - len(xbox_prefix)
-                xbox_gamertag: str = xbox_prefix + self._generate_random_string(suffix_length)
+                if self.use_random_gamertag and self._gamertag_pool:
+                    xbox_gamertag = random.choice(self._gamertag_pool)
+                    self.logger.debug(f"Selected generated gamertag: {xbox_gamertag}")
+                else:
+                    xbox_prefix: str = XboxConfig.GAMERTAG_PREFIX
+                    suffix_length: int = XboxConfig.GAMERTAG_SUFFIX_LENGTH - len(xbox_prefix)
+                    xbox_gamertag: str = xbox_prefix + self._generate_random_string(suffix_length)
 
                 reserve_body: Dict[str, Dict[str, Union[str, int]]] = {
                     "GamertagReserve": {
@@ -1117,6 +1141,14 @@ class XboxAccountCreator:
                         f"Gamertag {xbox_gamertag} not available: {response.status_code.as_int()}"
                     )
 
+                    if self.use_random_gamertag and xbox_gamertag in self._gamertag_pool:
+                        self._gamertag_pool.remove(xbox_gamertag)
+
+                        if len(self._gamertag_pool) < 3:
+                            generated = await self._generate_gamertags(session, proxy_url, headers)
+                            if generated:
+                                self._gamertag_pool.extend(generated)
+
                     await asyncio.sleep(XboxConfig.GAMERTAG_ATTEMPT_DELAY)
 
             self.logger.error(f"Failed to find available gamertag after {max_attempts} attempts")
@@ -1129,11 +1161,22 @@ class XboxAccountCreator:
 
     async def _set_avatar(self, session: Session, proxy_url: str, headers: Dict[str, str]) -> None:
         try:
-            avatar_body: Dict[str, Dict[str, str]] = {
-                "SetGamerpic": {"GamerPic": XboxConfig.DEFAULT_AVATAR_URL}
-            }
+            if self.use_random_gamerpic and self._gamerpic_cache is None:
+                await self._fetch_gamerpics(session, proxy_url, headers)
 
-            self.logger.debug("Setting default avatar")
+            if self.use_random_gamerpic and self._gamerpic_cache:
+                selected_gamerpic = random.choice(self._gamerpic_cache)
+                gamerpic_url = selected_gamerpic["Url"]
+                gamerpic_alt = selected_gamerpic.get("AltText", "No description")
+                self.logger.info(f"Selected gamerpic: {gamerpic_alt}")
+                self.logger.debug(f"Gamerpic URL: {gamerpic_url}")
+            else:
+                gamerpic_url = XboxConfig.DEFAULT_AVATAR_URL
+                self.logger.debug("Using default avatar")
+
+            avatar_body: Dict[str, Dict[str, str]] = {"SetGamerpic": {"GamerPic": gamerpic_url}}
+
+            self.logger.debug("Setting avatar")
             response = await session.post(proxy_url, json=avatar_body, headers=headers)
 
             if response.status_code.as_int() == 201:
@@ -1143,6 +1186,70 @@ class XboxAccountCreator:
 
         except Exception as e:
             self.logger.warning(f"Avatar setting failed (non-critical): {e}")
+
+    async def _fetch_gamerpics(
+        self, session: Session, proxy_url: str, headers: Dict[str, str]
+    ) -> None:
+        """Fetch available gamerpics from Xbox Live."""
+        try:
+            gamerpic_body: Dict[str, Dict[str, bool]] = {
+                "GamerpicManifest": {"SkipAuthorization": True, "EnableAltText": True}
+            }
+
+            self.logger.debug("Fetching available gamerpics")
+            response = await session.post(proxy_url, json=gamerpic_body, headers=headers)
+
+            if response.status_code.as_int() == 200:
+                data = await response.json()
+                general_gamerpics = data.get("GeneralGamerPics", [])
+
+                if general_gamerpics:
+                    self._gamerpic_cache = general_gamerpics
+                    self.logger.debug(f"Cached {len(general_gamerpics)} gamerpics")
+                else:
+                    self.logger.warning("No gamerpics returned, will use default")
+            else:
+                self.logger.warning(f"Failed to fetch gamerpics: {response.status_code.as_int()}")
+
+        except Exception as e:
+            self.logger.warning(f"Gamerpic fetching failed (non-critical): {e}")
+
+    async def _generate_gamertags(
+        self, session: Session, proxy_url: str, headers: Dict[str, str]
+    ) -> List[str]:
+        """Generate gamertags using Xbox Live's algorithm."""
+        try:
+            gamertag_body: Dict[str, Dict[str, Union[str, int]]] = {
+                "GamertagGenerate": {
+                    "Algorithm": XboxConfig.GAMERTAG_GENERATE_ALGORITHM,
+                    "Count": XboxConfig.GAMERTAG_GENERATE_COUNT,
+                }
+            }
+
+            self.logger.debug(f"Generating {XboxConfig.GAMERTAG_GENERATE_COUNT} gamertags")
+            response = await session.post(proxy_url, json=gamertag_body, headers=headers)
+
+            if response.status_code.as_int() == 200:
+                data = await response.json()
+                gamertags = data.get("Gamertags", [])
+
+                clean_gamertags = []
+                for gt in gamertags:
+                    clean_gt = "".join(char for char in gt if not char.isdigit())
+                    if clean_gt:
+                        clean_gamertags.append(clean_gt)
+
+                self.logger.debug(f"Generated {len(clean_gamertags)} clean gamertags")
+                return clean_gamertags
+            else:
+                self.logger.warning(
+                    f"Failed to generate gamertags: {response.status_code.as_int()}"
+                )
+                return []
+
+        except Exception as e:
+            self.logger.warning(f"Gamertag generation failed: {e}")
+            return []
 
     async def _save_account_data(
         self, gamertag: str, xbl_token: str, credentials: AccountCredentials
@@ -1360,6 +1467,18 @@ async def amain():
         default=XboxConfig.DEFAULT_CONNECTION_POOL_SIZE,
         help="Connection pool size",
     )
+    parser.add_argument(
+        "--old-gamertag",
+        action="store_true",
+        default=False,
+        help="Use old random string method instead of Xbox's AdjectiveNoun gamertag generation (default: Xbox generated)",
+    )
+    parser.add_argument(
+        "--default-gamerpic",
+        action="store_true",
+        default=False,
+        help="Use default gamerpic instead of random selection from Xbox (default: random from Xbox)",
+    )
 
     args = parser.parse_args()
 
@@ -1368,6 +1487,8 @@ async def amain():
         debug_mode=args.debug,
         proxy_url=args.proxy,
         connection_pool_size=args.pool_size,
+        use_random_gamertag=not args.old_gamertag,
+        use_random_gamerpic=not args.default_gamerpic,
     )
 
     accounts = creator.load_accounts_from_file(args.accounts)
