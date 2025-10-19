@@ -94,7 +94,9 @@ class XboxConfig:
     GAMERTAG_PREFIX: str = "Gamer"
 
     # Gamertag reservation
-    MAX_GAMERTAG_ATTEMPTS: int = 20
+    MAX_GAMERTAG_ATTEMPTS: int = (
+        1000  # Essentially infinite - Xbox generates guaranteed unique names
+    )
     GAMERTAG_ATTEMPT_DELAY: float = 0.25
     RESERVATION_DURATION: str = "1:00:00"
 
@@ -1233,14 +1235,8 @@ class XboxAccountCreator:
                 data = await response.json()
                 gamertags = data.get("Gamertags", [])
 
-                clean_gamertags = []
-                for gt in gamertags:
-                    clean_gt = "".join(char for char in gt if not char.isdigit())
-                    if clean_gt:
-                        clean_gamertags.append(clean_gt)
-
-                self.logger.debug(f"Generated {len(clean_gamertags)} clean gamertags")
-                return clean_gamertags
+                self.logger.debug(f"Generated {len(gamertags)} gamertags")
+                return gamertags
             else:
                 self.logger.warning(
                     f"Failed to generate gamertags: {response.status_code.as_int()}"
